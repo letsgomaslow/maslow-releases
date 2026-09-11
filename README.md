@@ -4,9 +4,9 @@ Public delivery infrastructure for signed Maslow Hub packages and channel metada
 
 ## Status
 
-Internal staging offers Hub 0.2.0 and the exact 0.1.3 rollback baseline. Package downloads and signatures were verified anonymously before this metadata promotion. End-user internet update/rollback and experimental local observability acceptance remain pending; this is not a stable release. Alpha is not published.
+Internal staging offers Hub 0.2.1 recovery improvements, retaining 0.2.0 and the exact 0.1.3 rollback baseline. Package downloads and signatures were verified anonymously before this metadata promotion. The recovery update clarifies installation progress, requirements, Docker access and update discovery. End-user internet update/rollback and experimental local observability acceptance remain pending; this is not a stable release. Alpha is not published.
 
-Staging manifest sequence: 2. Metadata expires on 2026-09-24 at 23:56:41 UTC. Expired metadata must be renewed and signed; clients must not bypass expiry or signature checks.
+Staging manifest sequence: 3. Metadata expires on 2026-09-24 at 23:56:41 UTC. Expired metadata must be renewed and signed; clients must not bypass expiry or signature checks.
 
 Use Hub's Updates page only after trusted enrollment. The bootstrap script and public verification key are in `bootstrap/`; authenticate the script checksum and public-key fingerprint through an independently trusted operator before running it. Never copy a private signing key to an end-user computer. No ISO rebuild is needed for this Hub update.
 
