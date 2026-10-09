@@ -1,0 +1,199 @@
+name: Build and publish Hub staging release
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Reviewed full commit SHA from the private Hub repository
+        required: true
+        type: string
+      recipe_sha:
+        description: Reviewed full commit SHA from maslow-os-pkgs
+        required: true
+        default: 448856485e710caedfc24f544a027aea8652dd33
+        type: string
+      release_notes:
+        description: User-facing release notes (one item per line; internal staging only)
+        required: true
+        type: string
+      request_publication:
+        description: After building, request my approval to sign and publish this candidate
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment: hub-source-build
+    outputs:
+      review_sha: ${{ steps.review.outputs.sha }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Validate exact build inputs
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          RECIPE_SHA: ${{ inputs.recipe_sha }}
+          RELEASE_NOTES: ${{ inputs.release_notes }}
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib, re
+          for name in ('SOURCE_SHA', 'RECIPE_SHA'):
+              if not re.fullmatch('[0-9a-f]{40}', os.environ[name]):
+                  raise SystemExit('Use full lowercase 40-character commit SHAs')
+          notes = [line.strip() for line in os.environ['RELEASE_NOTES'].splitlines() if line.strip()]
+          if not notes or len(notes) > 20 or any(len(note) > 1000 for note in notes):
+              raise SystemExit('Supply 1-20 release notes, each at most 1000 characters')
+          pathlib.Path(os.environ['RUNNER_TEMP'], 'notes.json').write_text(json.dumps(notes))
+          PY
+
+      - name: Fetch private source with a read-only repository key
+        env:
+          HUB_SOURCE_READ_KEY: ${{ secrets.HUB_SOURCE_READ_KEY }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          RECIPE_SHA: ${{ inputs.recipe_sha }}
+        run: |
+          set -euo pipefail
+          umask 077
+          key="$RUNNER_TEMP/hub-source-key"
+          hosts="$RUNNER_TEMP/github-known-hosts"
+          trap 'rm -f "$key" "$hosts"' EXIT
+          [[ -n $HUB_SOURCE_READ_KEY ]]
+          printf '%s\n' "$HUB_SOURCE_READ_KEY" > "$key"
+          printf '%s\n' 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' > "$hosts"
+          git init -q "$RUNNER_TEMP/hub-source"
+          git -C "$RUNNER_TEMP/hub-source" remote add origin git@github.com:letsgomaslow/maslow-hub.git
+          GIT_SSH_COMMAND="ssh -i $key -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$hosts" \
+            git -C "$RUNNER_TEMP/hub-source" fetch --depth=1 origin "$SOURCE_SHA"
+          git -C "$RUNNER_TEMP/hub-source" checkout -q --detach FETCH_HEAD
+          git init -q "$RUNNER_TEMP/package-source"
+          git -C "$RUNNER_TEMP/package-source" remote add origin https://github.com/letsgomaslow/maslow-os-pkgs.git
+          git -C "$RUNNER_TEMP/package-source" fetch --depth=1 origin "$RECIPE_SHA"
+          git -C "$RUNNER_TEMP/package-source" checkout -q --detach FETCH_HEAD
+
+      - name: Read signed channel and install archive reader
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libarchive-tools
+          command -v gpg
+          git fetch --no-tags origin refs/heads/signed-staging
+          python3 tools/channel-data.py extract --base "$(git rev-parse FETCH_HEAD)" --directory "$RUNNER_TEMP/published"
+
+      - name: Build and inspect candidate without signing credentials
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          RECIPE_SHA: ${{ inputs.recipe_sha }}
+        run: |
+          python3 tools/build-candidate.py \
+            --source-dir "$RUNNER_TEMP/hub-source" --source-sha "$SOURCE_SHA" \
+            --recipe-dir "$RUNNER_TEMP/package-source" --recipe-sha "$RECIPE_SHA" \
+            --channel-dir "$RUNNER_TEMP/published" --public-key bootstrap/release.pem \
+            --arch-image archlinux@sha256:996c3a1d6b0d87b01242f6fcd8cfa3ad3eece1a67ab5c8f108e20af1d7b97bdd \
+            --notes-file "$RUNNER_TEMP/notes.json" --output-dir "$RUNNER_TEMP/candidate"
+
+      - name: Record the exact candidate for approval
+        id: review
+        run: |
+          set -euo pipefail
+          sha=$(sha256sum "$RUNNER_TEMP/candidate/review.json" | cut -d ' ' -f 1)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          {
+            echo '## Candidate awaiting your publication approval'
+            echo 'Check source and recipe revisions, package checksum, Voice provenance and release notes below. Approval publishes an internal staging release, not stable acceptance.'
+            echo '```json'
+            cat "$RUNNER_TEMP/candidate/review.json"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Encrypt unsigned candidate before artifact storage
+        env:
+          HUB_CANDIDATE_ENCRYPTION_KEY: ${{ secrets.HUB_CANDIDATE_ENCRYPTION_KEY }}
+        run: python3 tools/candidate-transfer.py encrypt --source "$RUNNER_TEMP/candidate" --destination "$RUNNER_TEMP/encrypted-candidate"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: encrypted-hub-candidate
+          path: ${{ runner.temp }}/encrypted-candidate/
+          retention-days: 7
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    if: inputs.request_publication
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: hub-release-publishing
+    concurrency:
+      group: hub-staging-publish
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      pages: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: encrypted-hub-candidate
+          path: ${{ runner.temp }}/encrypted-candidate
+
+      - name: Confirm approved review and decrypt the same candidate
+        env:
+          REVIEW_SHA: ${{ needs.build.outputs.review_sha }}
+          HUB_CANDIDATE_ENCRYPTION_KEY: ${{ secrets.HUB_CANDIDATE_ENCRYPTION_KEY }}
+        run: |
+          set -euo pipefail
+          [[ $(sha256sum "$RUNNER_TEMP/encrypted-candidate/review.json" | cut -d ' ' -f 1) == "$REVIEW_SHA" ]]
+          python3 tools/candidate-transfer.py decrypt --source "$RUNNER_TEMP/encrypted-candidate" --destination "$RUNNER_TEMP/candidate"
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libarchive-tools
+
+      - name: Read the latest channel after approval
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin refs/heads/signed-staging
+          base=$(git rev-parse FETCH_HEAD)
+          echo "PUBLISHED_BASE=$base" >> "$GITHUB_ENV"
+          python3 tools/channel-data.py extract --base "$base" --directory "$RUNNER_TEMP/published"
+          fingerprint=$(openssl pkey -pubin -in bootstrap/release.pem -outform DER | sha256sum | cut -d ' ' -f 1)
+          [[ $fingerprint == daacaa5aac138710a3950097b29a05abd3f69c9a8efad512321c45f3103d1ee4 ]]
+
+      - name: Sign and publish the approved immutable package
+        env:
+          HUB_RELEASE_SIGNING_KEY: ${{ secrets.HUB_RELEASE_SIGNING_KEY }}
+          HUB_SIGNING_PASSPHRASE: ${{ secrets.HUB_SIGNING_PASSPHRASE }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          umask 077
+          key="$RUNNER_TEMP/release-key.pem"
+          trap 'rm -f "$key"' EXIT
+          [[ -n $HUB_RELEASE_SIGNING_KEY && -n $HUB_SIGNING_PASSPHRASE ]]
+          printf '%s\n' "$HUB_RELEASE_SIGNING_KEY" > "$key"
+          packages=("$RUNNER_TEMP/candidate/"*.pkg.tar.zst)
+          [[ ${#packages[@]} == 1 ]]
+          python3 tools/publish-candidate.py \
+            --package "${packages[0]}" --review "$RUNNER_TEMP/candidate/review.json" \
+            --channel-dir "$RUNNER_TEMP/published" --public-key bootstrap/release.pem \
+            --private-key "$key" --output-dir "$RUNNER_TEMP/release" --publish
+
+      - name: Promote both signed pairs together
+        run: |
+          set -euo pipefail
+          commit=$(python3 tools/channel-data.py commit --base "$PUBLISHED_BASE" --directory "$RUNNER_TEMP/release/channel")
+          git push origin "$commit:refs/heads/signed-staging"
+
+      - name: Rebuild Pages
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X POST "repos/${{ github.repository }}/pages/builds"
+
+      - name: Verify anonymous signed delivery
+        run: |
+          python3 tools/verify-delivery.py --expected-dir "$RUNNER_TEMP/release/channel" \
+            --public-key bootstrap/release.pem --base-url https://letsgomaslow.github.io/maslow-releases/hub/staging
