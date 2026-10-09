@@ -116,15 +116,20 @@ class Workstation:
     def public_key(self) -> Path:
         return self.signing / PUBLIC_KEY
 
+    def trust_root(self) -> Path:
+        """The pinned public key in this checkout, after checking its fingerprint. Needs no private key."""
+        path = self.root / "bootstrap/release.pem"
+        der = subprocess.run(["openssl", "pkey", "-pubin", "-in", str(path), "-outform", "DER"],
+                             capture_output=True, check=True).stdout
+        if hashlib.sha256(der).hexdigest() != self.trust_sha256:
+            raise ReleaseError("Public key fingerprint does not match the pinned release trust root")
+        return path
+
     def check_public_key(self) -> None:
         """The workstation's public key must be the pinned trust root shipped to every Hub."""
         if not self.public_key.is_file():
             raise ReleaseError(f"Missing {self.public_key}")
-        der = subprocess.run(["openssl", "pkey", "-pubin", "-in", str(self.public_key), "-outform", "DER"],
-                             capture_output=True, check=True).stdout
-        if hashlib.sha256(der).hexdigest() != self.trust_sha256:
-            raise ReleaseError("Public key fingerprint does not match the pinned release trust root")
-        if self.public_key.read_bytes() != (self.root / "bootstrap/release.pem").read_bytes():
+        if self.public_key.read_bytes() != self.trust_root().read_bytes():
             raise ReleaseError("Public key differs from bootstrap/release.pem in this checkout")
 
     def check_signing_files(self) -> None:
@@ -201,7 +206,7 @@ class Workstation:
         subprocess.run(["gh", "api", "-X", "POST", f"repos/{REPOSITORY}/pages/builds"], capture_output=True, check=True)
 
     def confirm_delivery(self, channel: Path) -> None:
-        load_tool("verify-delivery").confirm_delivery(channel, self.public_key, self.pages_url)
+        load_tool("verify-delivery").confirm_delivery(channel, self.trust_root(), self.pages_url)
 
     def publish_assets(self, artifacts: Path, review: dict) -> None:
         load_tool("publish-candidate").publish_assets(artifacts, review)
@@ -333,12 +338,12 @@ def op_renew(station: Workstation, days: int, push: bool) -> dict:
 
 
 def op_verify(station: Workstation, candidate: Path | None) -> dict:
-    station.check_public_key()
+    trust = station.trust_root()
     with tempfile.TemporaryDirectory(prefix="hub-verify-") as temporary:
         scratch = Path(temporary)
         channel = scratch / "published"
         base = station.fetch_channel(channel)
-        manifest, catalog = read_channel(channel, station.public_key)
+        manifest, catalog = read_channel(channel, trust)
         report = {"base": base, "channel": describe(manifest, catalog)}
         try:
             require_served(station, channel, scratch)
@@ -350,7 +355,7 @@ def op_verify(station: Workstation, candidate: Path | None) -> dict:
             publisher = load_tool("publish-candidate")
             package = single_package(candidate)
             review = publisher.load_review(candidate / "review.json", package)
-            next_manifest, next_catalog = publisher.next_metadata(channel, station.public_key, review,
+            next_manifest, next_catalog = publisher.next_metadata(channel, trust, review,
                                                                   dt.datetime.now(dt.timezone.utc))
             preserved_history(manifest, next_manifest)
             report["candidate"] = {"version": review["version"], "package": review["package"],
@@ -384,21 +389,21 @@ def exact_worktree(checkout: Path, commit: str, work: Path, label: str):
 
 def op_prepare(station: Workstation, source_sha: str, recipe_sha: str, notes: list[str]) -> dict:
     """Build a review-only candidate. No signing key is touched."""
-    station.check_public_key()
+    trust = station.trust_root()
     tools = station.tools_commit()
     builder = load_tool("build-candidate")
     with station.lock():
         run = station.run_dir("prepare")
         published = run / "published"
         base = station.fetch_channel(published)
-        read_channel(published, station.public_key)
+        read_channel(published, trust)
         notes_file = run / "notes.json"
         notes_file.write_text(json.dumps(notes))
         candidate = run / "candidate"
         with exact_worktree(station.hub, source_sha, station.work, "hub") as source, \
                 exact_worktree(station.recipe, recipe_sha, station.work, "recipe") as recipe:
             args = argparse.Namespace(source_dir=source, source_sha=source_sha, recipe_dir=recipe, recipe_sha=recipe_sha,
-                                      channel_dir=published, public_key=station.public_key, notes_file=notes_file,
+                                      channel_dir=published, public_key=trust, notes_file=notes_file,
                                       output_dir=candidate, arch_image=station.arch_image)
             try:
                 builder.build(args)
