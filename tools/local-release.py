@@ -150,7 +150,8 @@ class Workstation:
         result = subprocess.run(["openssl", "pkey", "-in", str(self.private_key), "-pubout", "-outform", "DER"],
                                 stdout=subprocess.PIPE)
         if result.returncode:
-            raise ReleaseError("OpenSSL could not read the private key (wrong passphrase or file)")
+            raise ReleaseError("OpenSSL could not unlock the private key. If it asked for the passphrase, it was not accepted; "
+                               "if it did not, run this in a real terminal window")
         return hashlib.sha256(result.stdout).hexdigest()
 
     # ---- tools checkout -----------------------------------------------------
@@ -310,8 +311,21 @@ def promote(station: Workstation, run: Path, base: str, signed: Path, record: di
 
 # ---- operations ---------------------------------------------------------------
 
+def require_terminal(station: Workstation) -> None:
+    """OpenSSL reads the passphrase from the controlling terminal; fail early and clearly without one."""
+    if "HUB_SIGNING_PASSPHRASE" in station.signing_environment():
+        return
+    try:
+        with open("/dev/tty"):
+            pass
+    except OSError as error:
+        raise ReleaseError("This step asks for the key passphrase and needs a real terminal window. "
+                           "Open a terminal (not an embedded command prompt) and run it there") from error
+
+
 def op_renew(station: Workstation, days: int, push: bool) -> dict:
     station.check_signing_files()
+    require_terminal(station)
     tools = station.tools_commit()
     with station.lock():
         run = station.run_dir("renew")
@@ -421,6 +435,7 @@ def op_prepare(station: Workstation, source_sha: str, recipe_sha: str, notes: li
 def op_publish(station: Workstation, candidate: Path, approved_review: str, push: bool) -> dict:
     """Sign and publish an approved candidate. Requires the exact reviewed digest."""
     station.check_signing_files()
+    require_terminal(station)
     tools = station.tools_commit()
     if sha256(candidate / "review.json") != approved_review:
         raise ReleaseError("--approve does not match this candidate's review.json; review the exact candidate first")
@@ -565,6 +580,7 @@ def main(argv=None) -> int:
             return 0 if all(not str(value).startswith("FAILED") for value in result.values()) else 1
         if args.command == "fingerprint":
             station.check_signing_files()
+            require_terminal(station)
             print("OpenSSL will ask for the release key passphrase.")
             found = station.private_fingerprint()
             print(f"Private-key-derived public fingerprint: {found}")
