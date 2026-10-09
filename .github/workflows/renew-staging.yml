@@ -1,0 +1,97 @@
+name: Renew Hub staging signatures
+
+# Re-signs the published staging manifest and catalog with a fresh validity
+# window. tools/renew/renew-channel.py refuses to change releases, artifacts,
+# notes or catalog items, so this job can never publish a new Hub release.
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+
+concurrency:
+  group: hub-staging-renewal
+  cancel-in-progress: false
+
+jobs:
+  renew:
+    runs-on: ubuntu-latest
+    environment: hub-staging-signing
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Renew staging metadata
+        env:
+          HUB_RELEASE_SIGNING_KEY: ${{ secrets.HUB_RELEASE_SIGNING_KEY }}
+          HUB_SIGNING_PASSPHRASE: ${{ secrets.HUB_SIGNING_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          umask 077
+          key="$RUNNER_TEMP/release-key.pem"
+          trap 'rm -f "$key"' EXIT
+          if [[ -z $HUB_RELEASE_SIGNING_KEY || -z $HUB_SIGNING_PASSPHRASE ]]; then
+            echo "Set HUB_RELEASE_SIGNING_KEY and HUB_SIGNING_PASSPHRASE in the hub-staging-signing environment." >&2
+            exit 1
+          fi
+          printf '%s\n' "$HUB_RELEASE_SIGNING_KEY" > "$key"
+          python3 tools/renew/renew-channel.py \
+            --channel-dir hub/staging \
+            --private-key "$key" \
+            --public-key bootstrap/release.pem \
+            --output-dir "$RUNNER_TEMP/renewed"
+          umask 022
+          for name in manifest.json manifest.json.sig catalog.json catalog.json.sig; do
+            cp "$RUNNER_TEMP/renewed/$name" "hub/staging/$name"
+          done
+
+      - name: Verify against the pinned trust root
+        run: |
+          set -euo pipefail
+          for name in manifest catalog; do
+            openssl dgst -sha256 -verify bootstrap/release.pem \
+              -signature "hub/staging/$name.json.sig" "hub/staging/$name.json"
+          done
+          python3 - <<'PY'
+          import datetime as dt, json, sys
+          for name in ("manifest", "catalog"):
+              value = json.load(open(f"hub/staging/{name}.json"))
+              left = dt.datetime.fromisoformat(value["expiresAt"].replace("Z", "+00:00")) - dt.datetime.now(dt.timezone.utc)
+              print(f"{name}: sequence {value['sequence']}, {left.days} days remaining")
+              if left < dt.timedelta(days=10):
+                  sys.exit(f"{name} would expire in under 10 days")
+          PY
+
+      - name: Publish manifest and catalog together
+        run: |
+          set -euo pipefail
+          sequence=$(python3 -c 'import json; print(json.load(open("hub/staging/manifest.json"))["sequence"])')
+          git config user.name "maslow-release-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add hub/staging/manifest.json hub/staging/manifest.json.sig hub/staging/catalog.json hub/staging/catalog.json.sig
+          git commit -m "Renew signed Hub staging metadata (sequence $sequence)"
+          git push origin HEAD:main
+
+      - name: Rebuild Pages
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # Pushes made with the workflow token may not start a branch Pages build on their own.
+        run: gh api -X POST "repos/${{ github.repository }}/pages/builds"
+
+      - name: Confirm anonymous delivery
+        run: |
+          set -euo pipefail
+          expected=$(python3 -c 'import json; print(json.load(open("hub/staging/manifest.json"))["sequence"])')
+          for attempt in $(seq 1 30); do
+            served=$(curl -fsS "https://letsgomaslow.github.io/maslow-releases/hub/staging/manifest.json?run=${{ github.run_id }}-$attempt" \
+              | python3 -c 'import json, sys; print(json.load(sys.stdin)["sequence"])' || true)
+            if [[ $served == "$expected" ]]; then
+              echo "Pages serves sequence $served"
+              exit 0
+            fi
+            sleep 20
+          done
+          echo "Pages did not serve sequence $expected within 10 minutes" >&2
+          exit 1
