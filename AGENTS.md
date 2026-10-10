@@ -22,3 +22,10 @@ This repository contains public delivery metadata and documentation only. Runtim
 - `hub-source-build` holds a read-only deploy key for the private Hub repository and a random candidate-encryption key. The deploy key is deleted before source execution. Unsigned packages are encrypted before upload to this public repository's Actions artifacts; only allowlisted review metadata is readable. The encryption key is also present in `hub-release-publishing` so the approved job can decrypt the same candidate.
 - Publication verifies the review digest from the build job, the package checksum/version, previous signed metadata, immutable-release policy and public artifact bytes. It preserves all previous rollback entries and catalog items, then commits both signed pairs together. A competing update fails the normal fast-forward push; never force-push or lower sequences. Existing checksum tags/drafts require manual recovery; do not overwrite them or blindly rerun publication.
 - All automation runs from protected `main`. Pages serves `signed-staging` at the unchanged URL. The source clone, package recipe and package content are untrusted build inputs and must never execute in a signing job. Run `python3 -m unittest discover -s tests -v` for infrastructure changes; fixture checks do not establish a real cloud build or Lenovo acceptance.
+
+## Local release workstations
+
+- `tools/local-release.py` (see `docs/local-release.md`) lets the Lenovo or the Mac renew, prepare, verify and publish without GitHub Actions, through the same tools as the workflows. Machine paths stay in `~/.config/maslow-release/workstation.json`; the encrypted key stays in a 700 signing directory and OpenSSL prompts for its passphrase.
+- Signing runs only from a clean committed checkout of this repository. Before signing it fetches `signed-staging`, verifies it and requires Pages to serve exactly those bytes; publication is a normal fast-forward push. Never force-push, lower sequences, overwrite released assets or move checksum tags.
+- `--no-push` is a local rehearsal and publishes nothing. Tests use disposable keys and local fakes; they are not publication evidence.
+

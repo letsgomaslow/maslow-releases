@@ -155,10 +155,16 @@ def inside_container_checks():
     # Some updater-security tests deliberately exercise root-owned fixtures.
     # Their root process sees only a read-only export and its disposable copy,
     # with no network, credentials, Docker socket or candidate output mount.
-    source = Path("/tmp/check-source")
+    # Hub's Voice-delivery checks require every ancestor of a bundle path to be
+    # root-owned and not group/world-writable, so fixtures cannot live under the
+    # world-writable /tmp. Give the root test run a private root-owned temp tree.
+    private = Path("/root/hub-tests")
+    private.mkdir(mode=0o700)
+    source = private / "source"
     shutil.copytree("/inputs/source", source)
-    run(["python", "-m", "unittest", "discover", "-s", "tests", "-p", "test_*.py"], cwd=source, timeout=900)
-    run(["node", "tests/ui-contract-test.mjs"], cwd=source, timeout=300)
+    env = dict(os.environ, TMPDIR=str(private))
+    run(["python", "-m", "unittest", "discover", "-s", "tests", "-p", "test_*.py"], cwd=source, env=env, timeout=900)
+    run(["node", "tests/ui-contract-test.mjs"], cwd=source, env=env, timeout=300)
 
 
 def archive_preflight(source, package, version):
