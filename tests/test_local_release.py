@@ -62,6 +62,34 @@ class FakeStation(local.Workstation):
 
     def publish_assets(self, artifacts, review):
         self.published_assets.append((sorted(path.name for path in artifacts.iterdir()), review["version"]))
+        if getattr(self, "interrupt_upload", False):
+            # Simulate the terminal closing mid-upload: the draft has only the small files.
+            self.release = {"draft": True, "immutable": False, "files": {name: (artifacts / name).read_bytes()
+                                                                      for name in ("review.json", next(a.name for a in artifacts.iterdir() if a.name.endswith(".signature")))}}
+            raise subprocess.CalledProcessError(1, ["gh", "release", "create"])
+
+    release = None
+
+    def release_state(self, tag):
+        if self.release is None:
+            return None
+        return {"id": 1, "draft": self.release["draft"], "immutable": self.release["immutable"],
+                "assets": {name: "uploaded" for name in self.release["files"]}}
+
+    def download_release_asset(self, tag, name, destination):
+        (destination / name).write_bytes(self.release["files"][name])
+
+    def upload_release_asset(self, tag, path):
+        assert path.name not in self.release["files"], "never replaces an asset"
+        self.release["files"][path.name] = path.read_bytes()
+        self.uploads = getattr(self, "uploads", []) + [path.name]
+
+    def publish_draft(self, tag):
+        self.release.update(draft=False, immutable=True)
+
+    def verify_public_asset(self, tag, path):
+        if self.release["files"].get(path.name) != path.read_bytes():
+            raise local.ReleaseError(f"{path.name} differs")
 
 
 def deploy(remote_dir, site):
@@ -315,6 +343,50 @@ class LocalReleaseTest(unittest.TestCase):
         self.assertEqual(base, self.tip())
         self.assertEqual([], self.station.published_assets)
         self.assertEqual(6, record["after"]["manifestSequence"])
+
+    def interrupted_publish(self):
+        candidate = self.candidate()
+        self.station.interrupt_upload = True
+        with self.assertRaises(local.ReleaseError):
+            local.op_publish(self.station, candidate, local.sha256(candidate / "review.json"), push=True)
+        self.station.interrupt_upload = False
+        return candidate
+
+    def test_resume_finishes_an_interrupted_upload_without_the_passphrase(self):
+        self.interrupted_publish()
+        base = self.tip()
+        environment = self.station.signing_environment
+        self.station.signing_environment = lambda: (_ for _ in ()).throw(AssertionError("resume must not sign"))
+        record = local.op_resume(self.station)
+        self.station.signing_environment = environment
+        self.assertEqual(["maslow-hub-0.3.3-1-any.pkg.tar.zst"], self.station.uploads)
+        self.assertEqual({"draft": False, "immutable": True}, {k: self.station.release[k] for k in ("draft", "immutable")})
+        self.assertNotEqual(base, self.tip())
+        self.assertEqual("0.3.3", self.remote_json("manifest.json")["releases"][-1]["version"])
+        self.assertIn("deliveryVerifiedAt", record)
+        with self.assertRaisesRegex(local.ReleaseError, "no unfinished publication"):
+            local.op_resume(self.station)
+
+    def test_resume_refuses_a_draft_file_that_differs_from_the_signed_one(self):
+        self.interrupted_publish()
+        self.station.release["files"]["review.json"] = b"tampered"
+        base = self.tip()
+        with self.assertRaisesRegex(local.ReleaseError, "differs from the signed file"):
+            local.op_resume(self.station)
+        self.assertEqual(base, self.tip())
+
+    def test_resume_refuses_when_another_workstation_published_meanwhile(self):
+        self.interrupted_publish()
+        winner = self.competitor()
+        with self.assertRaisesRegex(local.ReleaseError, "stale"):
+            local.op_resume(self.station)
+        self.assertEqual(winner, self.tip())
+
+    def test_resume_refuses_a_public_release_that_is_not_immutable(self):
+        self.interrupted_publish()
+        self.station.publish_draft = lambda tag: self.station.release.update(draft=False, immutable=False)
+        with self.assertRaisesRegex(local.ReleaseError, "immutable"):
+            local.op_resume(self.station)
 
     def test_an_existing_version_cannot_be_republished(self):
         candidate = self.candidate("0.3.2")

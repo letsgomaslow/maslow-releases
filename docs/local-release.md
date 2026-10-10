@@ -32,6 +32,7 @@ The passphrase is typed into OpenSSL's own prompt each time. It is never stored,
 - `publish --candidate DIR --approve <review sha256> [--no-push]`: signs and publishes an approved candidate. It never runs without the exact reviewed digest; publish a new version only after the release owner approves that digest.
 
 `--no-push` signs and verifies everything locally and publishes nothing. Use it to rehearse with the production key.
+- `resume` (no passphrase): finishes an interrupted publish. `publish` keeps its signed files in the run folder before uploading. `resume` re-verifies them against the pinned key and the approved checksum, compares any draft assets byte for byte and uploads only missing ones (never replacing), publishes the release, checks the anonymous downloads and promotes the channel. It refuses if anyone has published since the run started.
 
 ## Two workstations, one channel
 

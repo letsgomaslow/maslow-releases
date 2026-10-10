@@ -212,6 +212,34 @@ class Workstation:
     def publish_assets(self, artifacts: Path, review: dict) -> None:
         load_tool("publish-candidate").publish_assets(artifacts, review)
 
+    # ---- release recovery (used by `resume`) ----------------------------------------
+    def release_state(self, tag: str) -> dict | None:
+        """The GitHub release for a checksum tag, drafts included (authenticated read)."""
+        result = subprocess.run(["gh", "api", f"repos/{REPOSITORY}/releases?per_page=100", "--paginate", "--slurp"],
+                                capture_output=True, text=True, check=True)
+        found = [item for page in json.loads(result.stdout) for item in page if item["tag_name"] == tag]
+        if len(found) > 1:
+            raise ReleaseError(f"More than one release uses {tag}; inspect them manually")
+        if not found:
+            return None
+        return {"id": found[0]["id"], "draft": found[0]["draft"], "immutable": found[0].get("immutable") is True,
+                "assets": {asset["name"]: asset["state"] for asset in found[0]["assets"]}}
+
+    def download_release_asset(self, tag: str, name: str, destination: Path) -> None:
+        subprocess.run(["gh", "release", "download", tag, "--repo", REPOSITORY, "--pattern", name, "--dir", str(destination)],
+                       capture_output=True, check=True)
+
+    def upload_release_asset(self, tag: str, path: Path) -> None:
+        # No --clobber: an existing asset is never replaced.
+        subprocess.run(["gh", "release", "upload", tag, str(path), "--repo", REPOSITORY], capture_output=True, check=True)
+
+    def publish_draft(self, tag: str) -> None:
+        subprocess.run(["gh", "release", "edit", tag, "--repo", REPOSITORY, "--draft=false", "--latest=false"],
+                       capture_output=True, check=True)
+
+    def verify_public_asset(self, tag: str, path: Path) -> None:
+        load_tool("publish-candidate").verify_anonymous(f"https://github.com/{REPOSITORY}/releases/download/{tag}/{path.name}", path)
+
     # ---- locking and records ------------------------------------------------
     @contextlib.contextmanager
     def lock(self):
@@ -456,19 +484,92 @@ def op_publish(station: Workstation, candidate: Path, approved_review: str, push
         write_record(run, record)
         print("OpenSSL will ask for the release key passphrase three times (package, manifest, catalog).")
         output = run / "release"
-        with contextlib.ExitStack() as stack:
-            stack.enter_context(_environment(station.signing_environment()))
-            if push:
-                stack.enter_context(_patched(publisher, "publish_assets", station.publish_assets))
+        # Sign into the run folder first and keep it, so an interrupted upload can be finished with
+        # `resume` instead of signing again.
+        with _environment(station.signing_environment()):
             try:
                 publisher.prepare(package, candidate / "review.json", published, station.public_key,
-                                  station.private_key, output, publish=push)
+                                  station.private_key, output, publish=False)
             except (ValueError, OSError, subprocess.CalledProcessError) as error:
                 raise ReleaseError(f"Publication rejected: {error}") from error
+        if push:
+            try:
+                station.publish_assets(output / "artifacts", review)
+            except (ValueError, OSError, subprocess.CalledProcessError) as error:
+                raise ReleaseError(f"Upload stopped ({error}). Everything is signed; finish with: maslow-release resume") from error
         new_manifest, new_catalog = read_channel(output / "channel", station.public_key)
         preserved_history(manifest, new_manifest)
         record["after"] = describe(new_manifest, new_catalog)
         promote(station, run, base, output / "channel", record, push)
+        return record
+
+
+def op_resume(station: Workstation, run: Path | None = None) -> dict:
+    """Finish an interrupted publish from its already-signed files. Needs no passphrase.
+
+    Everything is re-verified first; existing release assets are compared, never replaced; the
+    channel is promoted only if nobody has published since the run fetched it.
+    """
+    station.check_public_key()
+    trust = station.trust_root()
+    with station.lock():
+        if run is None:
+            unfinished = [path for path in sorted((station.work / "runs").glob("*-publish"), reverse=True)
+                          if not json.loads((path / "record.json").read_text()).get("deliveryVerifiedAt")]
+            if not unfinished:
+                raise ReleaseError("There is no unfinished publication to resume")
+            run = unfinished[0]
+        record = json.loads((run / "record.json").read_text())
+        staged = [run / "release"] if (run / "release/channel").is_dir() else [path for path in run.glob(".hub-publication-*") if path.is_dir()]
+        if len(staged) != 1:
+            raise ReleaseError(f"{run} has no signed publication files; run publish again")
+        artifacts, channel = staged[0] / "artifacts", staged[0] / "channel"
+        package = artifacts / record["package"]["filename"]
+        if sha256(package) != record["package"]["sha256"] or package.stat().st_size != record["package"]["size"]:
+            raise ReleaseError("The staged package does not match the approved checksum")
+        for path, signature in ((package, Path(f"{package}.signature")), (channel / "manifest.json", channel / "manifest.json.sig"),
+                                (channel / "catalog.json", channel / "catalog.json.sig")):
+            result = subprocess.run(["openssl", "dgst", "-sha256", "-verify", str(trust), "-signature", str(signature), str(path)],
+                                    capture_output=True)
+            if result.returncode:
+                raise ReleaseError(f"{path.name} does not verify against the pinned key")
+        manifest, catalog = read_channel(channel, trust)
+        preserved_history(json.loads((run / "published/manifest.json").read_text()), manifest)
+        if manifest["releases"][-1]["sha256"] != record["package"]["sha256"]:
+            raise ReleaseError("The signed channel does not point at the approved package")
+        if station.remote_tip() != record["base"]:
+            raise ReleaseError("Another publication happened after this run fetched the channel; "
+                               "its signed files are now stale. Run publish again")
+        tag = "sha256-" + record["package"]["sha256"]
+        state = station.release_state(tag)
+        if state is None:
+            raise ReleaseError("No GitHub release exists for this run yet; run publish again")
+        names = [package.name, package.name + ".signature", "review.json"]
+        steps = []
+        if state["draft"]:
+            for name in names:
+                if name in state["assets"]:
+                    if state["assets"][name] != "uploaded":
+                        raise ReleaseError(f"{name} is only partly uploaded; delete that asset from the draft in GitHub, then resume")
+                    with tempfile.TemporaryDirectory(prefix="hub-resume-") as temporary:
+                        station.download_release_asset(tag, name, Path(temporary))
+                        if (Path(temporary) / name).read_bytes() != (artifacts / name).read_bytes():
+                            raise ReleaseError(f"The draft's {name} differs from the signed file; inspect the draft manually")
+                    steps.append(f"{name}: already uploaded and identical")
+                else:
+                    print(f"Uploading {name} (the package takes several minutes)...", flush=True)
+                    station.upload_release_asset(tag, artifacts / name)
+                    steps.append(f"{name}: uploaded")
+            station.publish_draft(tag)
+            state = station.release_state(tag)
+            steps.append("release published")
+        if not state or state["draft"] or not state["immutable"]:
+            raise ReleaseError("The release is not public and immutable; inspect it in GitHub")
+        for name in names:
+            station.verify_public_asset(tag, artifacts / name)
+        steps.append("anonymous downloads match")
+        record.update(after=describe(manifest, catalog), resumedAt=utc_stamp(), resumeSteps=steps)
+        promote(station, run, record["base"], channel, record, push=True)
         return record
 
 
@@ -482,16 +583,6 @@ def _environment(values: dict):
     finally:
         os.environ.clear()
         os.environ.update(saved)
-
-
-@contextlib.contextmanager
-def _patched(module, name, replacement):
-    original = getattr(module, name)
-    setattr(module, name, replacement)
-    try:
-        yield
-    finally:
-        setattr(module, name, original)
 
 
 def op_doctor(station: Workstation) -> dict:
@@ -565,6 +656,8 @@ def main(argv=None) -> int:
     publish.add_argument("--candidate", type=Path, required=True)
     publish.add_argument("--approve", required=True, help="SHA-256 of the reviewed candidate review.json")
     publish.add_argument("--no-push", action="store_true", help="sign and verify locally only; publish nothing")
+    resume = commands.add_parser("resume", help="finish an interrupted publish from its signed files (no passphrase)")
+    resume.add_argument("--run", type=Path, help="a specific publish run directory (default: the latest unfinished)")
     renew = commands.add_parser("renew", help="re-sign the published channel with a fresh validity window")
     renew.add_argument("--days", type=int, default=30)
     renew.add_argument("--no-push", action="store_true", help="sign and verify locally only; publish nothing")
@@ -594,6 +687,11 @@ def main(argv=None) -> int:
             return 0
         if args.command == "publish":
             print(json.dumps(op_publish(station, args.candidate, args.approve, not args.no_push), indent=2))
+            return 0
+        if args.command == "resume":
+            record = op_resume(station, args.run)
+            print(json.dumps({key: record.get(key) for key in ("version", "newCommit", "resumeSteps", "deliveryVerifiedAt", "after")}, indent=2))
+            print(f"Done. Hub {record.get('version')} is live on the staging channel.")
             return 0
         if args.command == "renew":
             print(json.dumps(op_renew(station, args.days, not args.no_push), indent=2))
